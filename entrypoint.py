@@ -10,6 +10,9 @@ import os
 import sys
 import tempfile
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
 
 def materialize_credentials() -> None:
     """If GOOGLE_ADS_CREDENTIALS_JSON is set, write it to a temp file
@@ -27,3 +30,20 @@ def materialize_credentials() -> None:
             "or GOOGLE_ADS_CREDENTIALS_PATH\n"
         )
         sys.exit(1)
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Starlette middleware that requires `Authorization: Bearer <token>`.
+
+    Returns a 401 JSON response for anything else.
+    """
+
+    def __init__(self, app, token: str):
+        super().__init__(app)
+        self.token = token
+
+    async def dispatch(self, request, call_next):
+        header = request.headers.get("authorization", "")
+        if not header.startswith("Bearer ") or header[7:] != self.token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
