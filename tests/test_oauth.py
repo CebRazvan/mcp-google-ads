@@ -224,5 +224,119 @@ class InMemoryOAuthProviderTests(unittest.TestCase):
         self.assertIsNone(run(scenario()))
 
 
+class LoginRoutesTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["MCP_ADMIN_USER"] = "admin"
+        os.environ["MCP_ADMIN_PASSWORD"] = "hunter2"
+
+        from oauth.storage import InMemoryStore
+        from oauth.provider import InMemoryOAuthProvider
+        self.store = InMemoryStore()
+        self.provider = InMemoryOAuthProvider(self.store, issuer_url="https://example.com")
+        self.client = self._make_client()
+
+    def tearDown(self):
+        os.environ.pop("MCP_ADMIN_USER", None)
+        os.environ.pop("MCP_ADMIN_PASSWORD", None)
+
+    def _make_client(self, client_id="c1"):
+        from mcp.shared.auth import OAuthClientInformationFull
+        return OAuthClientInformationFull(
+            client_id=client_id, client_secret="s",
+            redirect_uris=["https://claude.ai/cb"],
+        )
+
+    def _make_auth_params(self, code_challenge="cc", state="st"):
+        from mcp.server.auth.provider import AuthorizationParams
+        from pydantic import AnyUrl
+        return AuthorizationParams(
+            state=state, scopes=[], code_challenge=code_challenge,
+            redirect_uri=AnyUrl("https://claude.ai/cb"),
+            redirect_uri_provided_explicitly=True, resource=None,
+        )
+
+    def _build_testclient(self):
+        from starlette.applications import Starlette
+        from starlette.testclient import TestClient
+        from oauth.login import build_login_route_list
+        app = Starlette(routes=build_login_route_list(self.provider))
+        return TestClient(app, follow_redirects=False)
+
+    async def _register_and_authorize(self):
+        await self.provider.register_client(self.client)
+        url = await self.provider.authorize(self.client, self._make_auth_params())
+        return url.rsplit("=", 1)[1]  # session_id
+
+    def test_get_login_with_valid_session_returns_form(self):
+        session_id = run(self._register_and_authorize())
+        with self._build_testclient() as c:
+            r = c.get(f"/oauth/login?session={session_id}")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("<form", r.text)
+        self.assertIn(session_id, r.text)
+        self.assertIn("csrf", r.text)
+
+    def test_get_login_with_unknown_session_returns_400(self):
+        with self._build_testclient() as c:
+            r = c.get("/oauth/login?session=nope")
+        self.assertEqual(r.status_code, 400)
+
+    def test_post_login_with_correct_credentials_redirects_with_code(self):
+        session_id = run(self._register_and_authorize())
+        with self._build_testclient() as c:
+            # GET first to receive CSRF cookie
+            r1 = c.get(f"/oauth/login?session={session_id}")
+            csrf_cookie = c.cookies.get("oauth_csrf")
+            self.assertIsNotNone(csrf_cookie)
+            # POST with the same CSRF
+            r2 = c.post("/oauth/login", data={
+                "session": session_id, "csrf": csrf_cookie,
+                "username": "admin", "password": "hunter2",
+            })
+        self.assertEqual(r2.status_code, 302)
+        loc = r2.headers["location"]
+        self.assertTrue(loc.startswith("https://claude.ai/cb?"))
+        self.assertIn("code=", loc)
+        self.assertIn("state=st", loc)
+
+    def test_post_login_with_wrong_password_returns_401(self):
+        session_id = run(self._register_and_authorize())
+        with self._build_testclient() as c:
+            c.get(f"/oauth/login?session={session_id}")
+            csrf_cookie = c.cookies.get("oauth_csrf")
+            r = c.post("/oauth/login", data={
+                "session": session_id, "csrf": csrf_cookie,
+                "username": "admin", "password": "wrong",
+            })
+        self.assertEqual(r.status_code, 401)
+
+    def test_post_login_with_mismatched_csrf_returns_400(self):
+        session_id = run(self._register_and_authorize())
+        with self._build_testclient() as c:
+            c.get(f"/oauth/login?session={session_id}")
+            r = c.post("/oauth/login", data={
+                "session": session_id, "csrf": "wrong-csrf",
+                "username": "admin", "password": "hunter2",
+            })
+        self.assertEqual(r.status_code, 400)
+
+    def test_post_login_consumes_session_so_replay_fails(self):
+        session_id = run(self._register_and_authorize())
+        with self._build_testclient() as c:
+            c.get(f"/oauth/login?session={session_id}")
+            csrf_cookie = c.cookies.get("oauth_csrf")
+            r1 = c.post("/oauth/login", data={
+                "session": session_id, "csrf": csrf_cookie,
+                "username": "admin", "password": "hunter2",
+            })
+            self.assertEqual(r1.status_code, 302)
+            # Replay — session was consumed
+            r2 = c.post("/oauth/login", data={
+                "session": session_id, "csrf": csrf_cookie,
+                "username": "admin", "password": "hunter2",
+            })
+        self.assertEqual(r2.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
