@@ -89,5 +89,140 @@ class InMemoryStoreTests(unittest.TestCase):
         self.assertEqual(result.state, "xyz")
 
 
+class InMemoryOAuthProviderTests(unittest.TestCase):
+    def setUp(self):
+        from oauth.storage import InMemoryStore
+        from oauth.provider import InMemoryOAuthProvider
+        self.store = InMemoryStore()
+        self.provider = InMemoryOAuthProvider(self.store, issuer_url="https://example.com")
+
+    def _make_client(self, client_id="c1"):
+        from mcp.shared.auth import OAuthClientInformationFull
+        return OAuthClientInformationFull(
+            client_id=client_id, client_secret="secret",
+            redirect_uris=["https://claude.ai/cb"],
+        )
+
+    def _make_auth_params(self, code_challenge="abc", state="xyz"):
+        from mcp.server.auth.provider import AuthorizationParams
+        from pydantic import AnyUrl
+        return AuthorizationParams(
+            state=state,
+            scopes=[],
+            code_challenge=code_challenge,
+            redirect_uri=AnyUrl("https://claude.ai/cb"),
+            redirect_uri_provided_explicitly=True,
+            resource=None,
+        )
+
+    def test_register_and_get_client_roundtrip(self):
+        async def scenario():
+            await self.provider.register_client(self._make_client("c1"))
+            return await self.provider.get_client("c1")
+        got = run(scenario())
+        self.assertIsNotNone(got)
+        self.assertEqual(got.client_id, "c1")
+
+    def test_authorize_returns_login_url_with_session_id(self):
+        async def scenario():
+            client = self._make_client()
+            await self.provider.register_client(client)
+            return await self.provider.authorize(client, self._make_auth_params())
+        url = run(scenario())
+        self.assertTrue(url.startswith("https://example.com/oauth/login?session="))
+
+    def test_authorize_persists_pending_login(self):
+        async def scenario():
+            client = self._make_client()
+            await self.provider.register_client(client)
+            url = await self.provider.authorize(client, self._make_auth_params(
+                code_challenge="challenge123"))
+            session_id = url.rsplit("=", 1)[1]
+            pending = await self.store.get_login_session(session_id)
+            return pending
+        pending = run(scenario())
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.code_challenge, "challenge123")
+        self.assertEqual(pending.state, "xyz")
+
+    def test_exchange_authorization_code_is_single_use(self):
+        from mcp.server.auth.provider import AuthorizationCode
+        import time as _time
+
+        async def scenario():
+            client = self._make_client()
+            await self.provider.register_client(client)
+            code = AuthorizationCode(
+                code="one-time", scopes=[],
+                expires_at=int(_time.time()) + 60,
+                client_id="c1", code_challenge="abc",
+                redirect_uri="https://claude.ai/cb",
+                redirect_uri_provided_explicitly=True,
+            )
+            await self.store.put_auth_code("one-time", code, ttl_seconds=60)
+
+            first = await self.provider.exchange_authorization_code(client, code)
+            second_code = await self.store.get_auth_code("one-time")
+            return first, second_code
+
+        token_pair, after = run(scenario())
+        self.assertIsNotNone(token_pair.access_token)
+        self.assertIsNotNone(token_pair.refresh_token)
+        self.assertIsNone(after, "auth code must be deleted after exchange")
+
+    def test_refresh_token_rotation_invalidates_old(self):
+        from mcp.server.auth.provider import RefreshToken
+
+        async def scenario():
+            client = self._make_client()
+            await self.provider.register_client(client)
+            # Seed a refresh token directly
+            old = RefreshToken(token="old-refresh", client_id="c1", scopes=[])
+            await self.store.put_refresh_token("old-refresh", old, ttl_seconds=60)
+
+            new_pair = await self.provider.exchange_refresh_token(client, old, [])
+            old_after = await self.store.get_refresh_token("old-refresh")
+            new_after = await self.store.get_refresh_token(new_pair.refresh_token)
+            return new_pair, old_after, new_after
+
+        new_pair, old_after, new_after = run(scenario())
+        self.assertIsNone(old_after, "old refresh token must be deleted")
+        self.assertIsNotNone(new_after, "new refresh token must be stored")
+        self.assertNotEqual(new_pair.refresh_token, "old-refresh")
+
+    def test_load_access_token_returns_stored_token(self):
+        from mcp.server.auth.provider import AccessToken
+
+        async def scenario():
+            tok = AccessToken(token="a1", client_id="c1", scopes=[], expires_at=None)
+            await self.store.put_access_token("a1", tok, ttl_seconds=60)
+            return await self.provider.load_access_token("a1")
+
+        got = run(scenario())
+        self.assertIsNotNone(got)
+
+    def test_verify_token_is_alias_of_load_access_token(self):
+        from mcp.server.auth.provider import AccessToken
+
+        async def scenario():
+            tok = AccessToken(token="a1", client_id="c1", scopes=[], expires_at=None)
+            await self.store.put_access_token("a1", tok, ttl_seconds=60)
+            return await self.provider.verify_token("a1")
+
+        got = run(scenario())
+        self.assertIsNotNone(got, "verify_token must return the same result as load_access_token")
+
+    def test_revoke_access_token_removes_from_storage(self):
+        from mcp.server.auth.provider import AccessToken
+
+        async def scenario():
+            tok = AccessToken(token="a1", client_id="c1", scopes=[], expires_at=None)
+            await self.store.put_access_token("a1", tok, ttl_seconds=60)
+            await self.provider.revoke_token(tok)
+            return await self.store.get_access_token("a1")
+
+        self.assertIsNone(run(scenario()))
+
+
 if __name__ == "__main__":
     unittest.main()
