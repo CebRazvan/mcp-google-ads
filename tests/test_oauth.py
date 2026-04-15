@@ -260,7 +260,7 @@ class LoginRoutesTests(unittest.TestCase):
         from starlette.testclient import TestClient
         from oauth.login import build_login_route_list
         app = Starlette(routes=build_login_route_list(self.provider))
-        return TestClient(app, follow_redirects=False)
+        return TestClient(app, base_url="https://testserver", follow_redirects=False)
 
     async def _register_and_authorize(self):
         await self.provider.register_client(self.client)

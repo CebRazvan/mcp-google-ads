@@ -45,7 +45,7 @@ async def handle_get_login(request: Request,
     ))
     resp.set_cookie(
         CSRF_COOKIE_NAME, csrf,
-        max_age=CSRF_TTL_SECONDS, httponly=True, samesite="lax",
+        max_age=CSRF_TTL_SECONDS, httponly=True, secure=True, samesite="lax",
     )
     return resp
 
@@ -83,7 +83,7 @@ async def handle_post_login(request: Request,
         ), status_code=401)
         resp.set_cookie(
             CSRF_COOKIE_NAME, csrf,
-            max_age=CSRF_TTL_SECONDS, httponly=True, samesite="lax",
+            max_age=CSRF_TTL_SECONDS, httponly=True, secure=True, samesite="lax",
         )
         return resp
 
