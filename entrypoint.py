@@ -47,3 +47,51 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not header.startswith("Bearer ") or header[7:] != self.token:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
+
+
+def build_app():
+    """Configure the FastMCP instance and return a Starlette ASGI app
+    with bearer auth middleware attached.
+
+    Must be called AFTER materialize_credentials(), because importing
+    google_ads_server reads GOOGLE_ADS_CREDENTIALS_PATH at module load.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+    from google_ads_server import mcp
+
+    port = int(os.environ.get("PORT", "8080"))
+    allowed_host = os.environ.get("MCP_ALLOWED_HOST", "gads.lucramresponsabil.com")
+    token = os.environ["MCP_AUTH_TOKEN"]  # main() already verified non-empty
+
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = port
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[allowed_host, f"{allowed_host}:*"],
+        allowed_origins=[f"https://{allowed_host}"],
+    )
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(BearerAuthMiddleware, token=token)
+    return app
+
+
+def main():
+    if not os.environ.get("MCP_AUTH_TOKEN"):
+        sys.stderr.write("ERROR: MCP_AUTH_TOKEN is required\n")
+        sys.exit(1)
+
+    materialize_credentials()
+
+    import uvicorn
+    app = build_app()
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8080")),
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()
