@@ -55,50 +55,5 @@ class MaterializeCredentialsTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
-class BearerAuthMiddlewareTests(unittest.TestCase):
-    def _build_app(self, token: str):
-        """Build a tiny Starlette app wrapped in our middleware."""
-        from starlette.applications import Starlette
-        from starlette.routing import Route
-        from starlette.responses import PlainTextResponse
-
-        async def ok(request):
-            return PlainTextResponse("ok")
-
-        app = Starlette(routes=[Route("/", ok)])
-        app.add_middleware(entrypoint.BearerAuthMiddleware, token=token)
-        return app
-
-    def test_rejects_request_without_authorization_header(self):
-        from starlette.testclient import TestClient
-        app = self._build_app("secret")
-        with TestClient(app) as c:
-            r = c.get("/")
-            self.assertEqual(r.status_code, 401)
-            self.assertEqual(r.json(), {"error": "unauthorized"})
-
-    def test_rejects_request_with_wrong_token(self):
-        from starlette.testclient import TestClient
-        app = self._build_app("secret")
-        with TestClient(app) as c:
-            r = c.get("/", headers={"Authorization": "Bearer wrong"})
-            self.assertEqual(r.status_code, 401)
-
-    def test_rejects_non_bearer_scheme(self):
-        from starlette.testclient import TestClient
-        app = self._build_app("secret")
-        with TestClient(app) as c:
-            r = c.get("/", headers={"Authorization": "Basic secret"})
-            self.assertEqual(r.status_code, 401)
-
-    def test_accepts_correct_bearer_token(self):
-        from starlette.testclient import TestClient
-        app = self._build_app("secret")
-        with TestClient(app) as c:
-            r = c.get("/", headers={"Authorization": "Bearer secret"})
-            self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.text, "ok")
-
-
 if __name__ == "__main__":
     unittest.main()

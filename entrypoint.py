@@ -1,17 +1,23 @@
-"""HTTP wrapper for cohnen/mcp-google-ads.
+"""HTTP wrapper for cohnen/mcp-google-ads with OAuth 2.0 Authorization Server.
 
-Wraps the upstream FastMCP server with:
-- credentials-from-env-var materialization
-- bearer-token auth middleware
-- DNS-rebinding allowlist for the production host
-- uvicorn-driven streamable-http serving
+The server plays two roles: it's both a Resource Server (the /mcp endpoint,
+gated by RequireAuthMiddleware) and an Authorization Server (the /authorize,
+/token, /register, /revoke, /.well-known/* routes, plus our custom /oauth/login
+form). FastMCP wires all of this together when `mcp._auth_server_provider` and
+`mcp._token_verifier` are set before streamable_http_app() is called.
+
+Note: `mcp._auth_server_provider` and `mcp._token_verifier` are SDK-internal
+attributes (underscore-prefixed). FastMCP reads them publicly in its
+streamable_http_app() method but does not expose a public setter because
+the canonical path is to pass them to FastMCP(auth_server_provider=...,
+token_verifier=...) at construction. Since google_ads_server.py creates
+its FastMCP instance at module-import time without these parameters, we
+set them after the fact. This is why the Dockerfile pins mcp>=1.27,<2 —
+if the internal attribute names change, the pin catches it immediately.
 """
 import os
 import sys
 import tempfile
-
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 
 
 def materialize_credentials() -> None:
@@ -32,54 +38,52 @@ def materialize_credentials() -> None:
         sys.exit(1)
 
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Starlette middleware that requires `Authorization: Bearer <token>`.
-
-    Returns a 401 JSON response for anything else.
-    """
-
-    def __init__(self, app, token: str):
-        super().__init__(app)
-        self.token = token
-
-    async def dispatch(self, request, call_next):
-        header = request.headers.get("authorization", "")
-        if not header.startswith("Bearer ") or header[7:] != self.token:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
 def build_app():
-    """Configure the FastMCP instance and return a Starlette ASGI app
-    with bearer auth middleware attached.
-
-    Must be called AFTER materialize_credentials(), because importing
-    google_ads_server reads GOOGLE_ADS_CREDENTIALS_PATH at module load.
-    """
+    """Configure FastMCP as AS + RS, wire the in-memory OAuth provider,
+    attach login form routes, and return the Starlette ASGI app."""
+    from mcp.server.auth.settings import (
+        AuthSettings, ClientRegistrationOptions, RevocationOptions,
+    )
     from mcp.server.transport_security import TransportSecuritySettings
     from google_ads_server import mcp
 
-    port = int(os.environ.get("PORT", "8080"))
+    from oauth import InMemoryStore, InMemoryOAuthProvider, register_login_routes
+
     allowed_host = os.environ.get("MCP_ALLOWED_HOST", "gads.lucramresponsabil.com")
-    token = os.environ["MCP_AUTH_TOKEN"]  # main() already verified non-empty
+    issuer_url = f"https://{allowed_host}"
 
     mcp.settings.host = "0.0.0.0"
-    mcp.settings.port = port
+    mcp.settings.port = int(os.environ.get("PORT", "8080"))
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[allowed_host, f"{allowed_host}:*"],
-        allowed_origins=[f"https://{allowed_host}"],
+        allowed_origins=[issuer_url],
     )
 
-    app = mcp.streamable_http_app()
-    app.add_middleware(BearerAuthMiddleware, token=token)
-    return app
+    store = InMemoryStore()
+    provider = InMemoryOAuthProvider(store, issuer_url=issuer_url)
+
+    mcp.settings.auth = AuthSettings(
+        issuer_url=issuer_url,
+        resource_server_url=issuer_url,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=None,
+    )
+    # SDK-internal attributes — see module docstring.
+    mcp._auth_server_provider = provider
+    mcp._token_verifier = provider
+
+    register_login_routes(mcp, provider)
+
+    return mcp.streamable_http_app()
 
 
 def main():
-    if not os.environ.get("MCP_AUTH_TOKEN"):
-        sys.stderr.write("ERROR: MCP_AUTH_TOKEN is required\n")
-        sys.exit(1)
+    for var in ("MCP_ADMIN_USER", "MCP_ADMIN_PASSWORD"):
+        if not os.environ.get(var):
+            sys.stderr.write(f"ERROR: {var} is required\n")
+            sys.exit(1)
 
     materialize_credentials()
 
